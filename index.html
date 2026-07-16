@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Crag Route Viewer</title>
+<style>
+:root { color-scheme: dark; --background:#171717; --foreground:#f5f5f5; --card:#232323; --border:#4b4b4b; --primary:#e5e5e5; --primary-foreground:#111; }
+body { margin:0; background:var(--background); color:var(--foreground); font-family:system-ui,sans-serif; }
+#crag-3d { padding:16px; max-width:1200px; margin:auto; }
+.viz-controls { display:flex; flex-wrap:wrap; gap:12px; align-items:end; margin-bottom:10px; }
+.form-label { display:grid; gap:4px; font-size:14px; }
+.form-control, .form-range, .btn { font:inherit; }
+.form-control { max-width:210px; color:var(--foreground); background:var(--card); border:1px solid var(--border); padding:6px; }
+.btn { color:var(--foreground); background:var(--card); border:1px solid var(--border); padding:7px 10px; cursor:pointer; }
+.btn-primary { background:var(--primary); color:var(--primary-foreground); }
+.text-muted { color:#c4c4c4; }
+.text-small { font-size:13px; }
+</style>
+</head>
+<body><section id="crag-3d" aria-label="Rotatable 3D LiDAR point cloud">
+  <div class="viz-controls">
+    <label class="form-label" for="crag-size">Point size <output id="crag-size-value">1.5</output>
+      <input class="form-range" id="crag-size" type="range" min="0.5" max="5" step="0.5" value="1.5">
+    </label>
+    <label class="form-label" for="scan-file">Load XYZ scan
+      <input class="form-control" id="scan-file" type="file" accept=".xyz,.txt,text/plain">
+    </label>
+    <button class="btn" id="crag-reset" type="button">Reset view</button>
+    <button class="btn btn-primary" id="route-toggle" type="button" aria-pressed="false">Draw route</button>
+    <button class="btn" id="route-clear" type="button">Clear route</button>
+    <label class="form-label" for="project-name">Project file name
+      <input class="form-control" id="project-name" type="text" value="crag-routes">
+    </label>
+    <button class="btn" id="project-save" type="button">Save project</button>
+    <label class="form-label" for="project-load">Open project
+      <input class="form-control" id="project-load" type="file" accept=".json,application/json">
+    </label>
+  </div>
+  <p class="text-muted text-small" id="crag-status">Loading 3D crag scan…</p>
+  <div class="crag-stage" id="crag-stage"><canvas id="crag-canvas" aria-label="Interactive three-dimensional point cloud of the Welsh crag"></canvas></div>
+</section>
+<style>
+  #crag-3d .crag-stage { position: relative; width: 100%; height: 460px; overflow: hidden; background: var(--card); }
+  #crag-3d canvas { display: block; width: 100%; height: 100%; cursor: crosshair; color: var(--primary); }
+  #crag-3d canvas:active { cursor: grabbing; }
+  @media (max-width: 480px) { #crag-3d .crag-stage { height: 340px; } }
+</style>
+<script type="module">
+  import * as THREE from 'https://esm.sh/three@0.166.1';
+  import { OrbitControls } from 'https://esm.sh/three@0.166.1/examples/jsm/controls/OrbitControls.js';
+  const root = document.getElementById('crag-3d');
+  const stage = root.querySelector('#crag-stage');
+  const canvas = root.querySelector('#crag-canvas');
+  const size = root.querySelector('#crag-size');
+  const sizeValue = root.querySelector('#crag-size-value');
+  const fileInput = root.querySelector('#scan-file');
+  const projectName = root.querySelector('#project-name');
+  const projectLoad = root.querySelector('#project-load');
+  const status = root.querySelector('#crag-status');
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(55, 1, 0.01, 100000);
+  const controls = new OrbitControls(camera, canvas);
+  controls.enableDamping = true;
+  controls.dampingFactor = 0.08;
+  const scan = new Float32Array([]);
+  const geometry = new THREE.BufferGeometry();
+  let positions = new Float32Array(scan.length / 2);
+  let colours = new Float32Array(scan.length / 2);
+  for (let point = 0, value = 0; value < scan.length; point += 3, value += 6) {
+    positions[point] = scan[value]; positions[point + 1] = scan[value + 1]; positions[point + 2] = scan[value + 2];
+    colours[point] = scan[value + 3] / 255; colours[point + 1] = scan[value + 4] / 255; colours[point + 2] = scan[value + 5] / 255;
+  }
+  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  geometry.setAttribute('color', new THREE.BufferAttribute(colours, 3));
+  geometry.computeBoundingSphere();
+  const cloud = new THREE.Points(geometry, new THREE.PointsMaterial({ size: Number(size.value), sizeAttenuation: true, vertexColors: true }));
+  scene.add(cloud);
+  const centre = geometry.boundingSphere ? geometry.boundingSphere.center.clone() : new THREE.Vector3();
+  let radius = geometry.boundingSphere ? Math.max(geometry.boundingSphere.radius, 1) : 1;
+  const raycaster = new THREE.Raycaster();
+  const pointer = new THREE.Vector2();
+  const originLatitude = 53.09083601367916;
+  const originLongitude = -4.049058389140163;
+  const originLatitudeRadians = THREE.MathUtils.degToRad(originLatitude);
+  const semiMajorAxis = 6378137;
+  const flattening = 1 / 298.257223563;
+  const eccentricitySquared = flattening * (2 - flattening);
+  const primeVertical = semiMajorAxis / Math.sqrt(1 - eccentricitySquared * Math.sin(originLatitudeRadians) ** 2);
+  const meridional = semiMajorAxis * (1 - eccentricitySquared) / (1 - eccentricitySquared * Math.sin(originLatitudeRadians) ** 2) ** 1.5;
+  function toWgs84(east, north) {
+    return {
+      latitude: originLatitude + THREE.MathUtils.radToDeg(north / meridional),
+      longitude: originLongitude + THREE.MathUtils.radToDeg(east / (primeVertical * Math.cos(originLatitudeRadians)))
+    };
+  }
+  raycaster.params.Points.threshold = radius * 0.02;
+  let routePoints = [];
+  let routeGeometry;
+  let route;
+  let routeNodes;
+  const routes = [];
+  const routeColour = new THREE.Color(0xff2020);
+  function createRoute() {
+    routePoints = [];
+    routeGeometry = new THREE.BufferGeometry();
+    const lineMaterial = new THREE.LineBasicMaterial({ color: routeColour, depthTest: false, transparent: true, opacity: 0.98 });
+    const nodeMaterial = new THREE.ShaderMaterial({
+      uniforms: { colour: { value: routeColour } },
+      vertexShader: `void main() { vec4 viewPosition = modelViewMatrix * vec4(position, 1.0); gl_PointSize = 2.0; gl_Position = projectionMatrix * viewPosition; }`,
+      fragmentShader: `uniform vec3 colour; void main() { if (length(gl_PointCoord - vec2(0.5)) > 0.5) discard; gl_FragColor = vec4(colour, 1.0); }`,
+      depthTest: false, depthWrite: false
+    });
+    route = new THREE.Line(routeGeometry, lineMaterial);
+    routeNodes = new THREE.Points(routeGeometry, nodeMaterial);
+    route.renderOrder = 2; routeNodes.renderOrder = 3;
+    scene.add(route, routeNodes);
+    routes.push({ geometry: routeGeometry, line: route, nodes: routeNodes, lineMaterial, nodeMaterial, points: routePoints });
+  }
+  function clearRoutes() {
+    for (const item of routes) { scene.remove(item.line, item.nodes); item.geometry.dispose(); item.lineMaterial.dispose(); item.nodeMaterial.dispose(); }
+    routes.length = 0; routePoints = []; routeGeometry = undefined; route = undefined; routeNodes = undefined;
+  }
+  let drawing = false;
+  let pointerDown;
+  function frame() {
+    const distance = radius / Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)) * 1.25;
+    camera.position.copy(centre).add(new THREE.Vector3(distance, distance * 0.45, distance * 0.8));
+    controls.target.copy(centre); controls.minDistance = radius * 0.01; controls.maxDistance = radius * 100; controls.update();
+  }
+  function resize() { const width = stage.clientWidth, height = stage.clientHeight; renderer.setSize(width, height, false); camera.aspect = width / height; camera.updateProjectionMatrix(); }
+  new ResizeObserver(resize).observe(stage); resize(); frame();
+  root.querySelector('#crag-reset').addEventListener('click', frame);
+  size.addEventListener('input', () => { sizeValue.value = size.value; cloud.material.size = Number(size.value); });
+  let baseStatus = 'Choose an XYZ scan to begin.';
+  status.textContent = baseStatus;
+  function pointAt(event) {
+    const box = canvas.getBoundingClientRect();
+    pointer.x = ((event.clientX - box.left) / box.width) * 2 - 1;
+    pointer.y = -((event.clientY - box.top) / box.height) * 2 + 1;
+    raycaster.setFromCamera(pointer, camera);
+    return raycaster.intersectObject(cloud, false)[0];
+  }
+  canvas.addEventListener('pointermove', (event) => {
+    if (drawing) return;
+    const hit = pointAt(event);
+    if (!hit) { status.textContent = baseStatus; return; }
+    const point = hit.index * 3;
+    const geographic = toWgs84(positions[point], positions[point + 1]);
+    status.textContent = `Point ${hit.index + 1}: Lat ${geographic.latitude.toFixed(8)}, Lon ${geographic.longitude.toFixed(8)}, local Z ${positions[point + 2].toFixed(4)}`;
+  });
+  canvas.addEventListener('pointerleave', () => { if (!drawing) status.textContent = baseStatus; });
+  canvas.addEventListener('pointerdown', (event) => { pointerDown = { x: event.clientX, y: event.clientY }; });
+  canvas.addEventListener('pointerup', (event) => {
+    if (!drawing || !pointerDown || Math.hypot(event.clientX - pointerDown.x, event.clientY - pointerDown.y) > 5) return;
+    const hit = pointAt(event);
+    if (!hit) return;
+    const point = hit.index * 3;
+    routePoints.push(new THREE.Vector3(positions[point], positions[point + 1], positions[point + 2]));
+    routeGeometry.setFromPoints(routePoints);
+    routeGeometry.computeBoundingSphere();
+    status.textContent = `Route: ${routePoints.length} point${routePoints.length === 1 ? '' : 's'} — click the next point.`;
+  });
+  const routeToggle = root.querySelector('#route-toggle');
+  routeToggle.addEventListener('click', () => {
+    const starting = !drawing;
+    drawing = starting;
+    if (starting) createRoute();
+    routeToggle.setAttribute('aria-pressed', String(drawing));
+    routeToggle.textContent = drawing ? 'Finish route' : 'Draw route';
+    status.textContent = drawing ? 'Route drawing active — click points on the crag.' : `${routePoints.length} route point${routePoints.length === 1 ? '' : 's'} placed.`;
+  });
+  root.querySelector('#route-clear').addEventListener('click', () => {
+    clearRoutes(); if (drawing) createRoute(); status.textContent = drawing ? 'Routes cleared — click a first point.' : baseStatus;
+  });
+  function parseXYZ(text) {
+    const source = text.split(/\r?\n/);
+    const cap = 25000, rawPositions = [], rawColours = [];
+    let valid = 0;
+    for (const line of source) {
+      const values = line.trim().split(/[\s,;]+/);
+      const start = values.length >= 8 ? 2 : 0;
+      if (values.length < start + 6 || values[0] === '') continue;
+      const x = Number(values[start]), y = Number(values[start + 1]), z = Number(values[start + 2]);
+      if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) continue;
+      const r = Number(values[start + 3]), g = Number(values[start + 4]), b = Number(values[start + 5]);
+      valid++;
+      const slot = rawPositions.length / 3 < cap ? rawPositions.length / 3 : Math.floor(Math.random() * valid);
+      if (slot >= cap) continue;
+      rawPositions[slot * 3] = x; rawPositions[slot * 3 + 1] = y; rawPositions[slot * 3 + 2] = z;
+      rawColours[slot * 3] = Number.isFinite(r) ? Math.max(0, Math.min(255, r)) / 255 : 0.75;
+      rawColours[slot * 3 + 1] = Number.isFinite(g) ? Math.max(0, Math.min(255, g)) / 255 : 0.75;
+      rawColours[slot * 3 + 2] = Number.isFinite(b) ? Math.max(0, Math.min(255, b)) / 255 : 0.75;
+    }
+    return { positions: new Float32Array(rawPositions), colours: new Float32Array(rawColours), valid };
+  }
+  fileInput.addEventListener('change', async () => {
+    const file = fileInput.files[0];
+    if (!file) return;
+    status.textContent = 'Loading scan…';
+    await new Promise(requestAnimationFrame);
+    try {
+      const loaded = parseXYZ(await file.text());
+      if (!loaded.positions.length) throw new Error('No XYZ point rows found.');
+      positions = loaded.positions; colours = loaded.colours;
+      geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+      geometry.setAttribute('color', new THREE.BufferAttribute(colours, 3));
+      geometry.computeBoundingSphere();
+      centre.copy(geometry.boundingSphere.center); radius = Math.max(geometry.boundingSphere.radius, 1);
+      raycaster.params.Points.threshold = radius * 0.02;
+      clearRoutes();
+      drawing = false; routeToggle.setAttribute('aria-pressed', 'false'); routeToggle.textContent = 'Draw route';
+      frame();
+      const shown = positions.length / 3;
+      baseStatus = loaded.valid === shown ? `${shown.toLocaleString()} points loaded — hover to inspect; drag to orbit.` : `${shown.toLocaleString()} sampled from ${loaded.valid.toLocaleString()} points — hover to inspect; drag to orbit.`;
+      status.textContent = baseStatus;
+    } catch (error) { status.textContent = error.message || 'The scan could not be loaded.'; }
+  });
+  function finishDrawing() {
+    drawing = false;
+    routeToggle.setAttribute('aria-pressed', 'false');
+    routeToggle.textContent = 'Draw route';
+  }
+  root.querySelector('#project-save').addEventListener('click', () => {
+    const project = {
+      version: 1,
+      camera: { position: camera.position.toArray(), target: controls.target.toArray() },
+      pointSize: Number(size.value),
+      origin: { latitude: originLatitude, longitude: originLongitude, axis: 'X east, Y north, metres' },
+      routes: routes.filter(item => item.points.length).map(item => item.points.map(point => point.toArray()))
+    };
+    const safeName = projectName.value.trim().replace(/[^a-z0-9._-]+/gi, '-') || 'crag-routes';
+    const download = document.createElement('a');
+    download.href = URL.createObjectURL(new Blob([JSON.stringify(project, null, 2)], { type: 'application/json' }));
+    download.download = `${safeName}.json`;
+    download.click();
+    setTimeout(() => URL.revokeObjectURL(download.href), 0);
+    status.textContent = `Saved ${project.routes.length} route${project.routes.length === 1 ? '' : 's'} and the current view.`;
+  });
+  projectLoad.addEventListener('change', async () => {
+    const file = projectLoad.files[0];
+    if (!file) return;
+    try {
+      const project = JSON.parse(await file.text());
+      if (!Array.isArray(project.routes) || !Array.isArray(project.camera?.position) || !Array.isArray(project.camera?.target)) throw new Error('This is not a valid crag route project.');
+      clearRoutes();
+      for (const savedRoute of project.routes) {
+        if (!Array.isArray(savedRoute) || !savedRoute.length) continue;
+        createRoute();
+        for (const savedPoint of savedRoute) if (Array.isArray(savedPoint) && savedPoint.length === 3) routePoints.push(new THREE.Vector3(...savedPoint));
+        routeGeometry.setFromPoints(routePoints); routeGeometry.computeBoundingSphere();
+      }
+      camera.position.fromArray(project.camera.position); controls.target.fromArray(project.camera.target); controls.update();
+      if (Number.isFinite(project.pointSize)) { size.value = String(project.pointSize); sizeValue.value = size.value; cloud.material.size = Number(size.value); }
+      finishDrawing();
+      status.textContent = `Loaded ${routes.length} saved route${routes.length === 1 ? '' : 's'} and the saved view.`;
+    } catch (error) { status.textContent = error.message || 'The project could not be loaded.'; }
+  });
+  function render() { requestAnimationFrame(render); controls.update(); renderer.render(scene, camera); }
+  render();
+</script>
+
+</body>
+</html>
